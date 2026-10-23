@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -16,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mikkims/ya_diploma_1/internal/auth"
 	"github.com/mikkims/ya_diploma_1/internal/handler"
 	"github.com/mikkims/ya_diploma_1/internal/model"
@@ -163,11 +163,11 @@ func TestPostgresLongOrders(t *testing.T) {
 		t.Fatal("missing number")
 	}
 	var left, right string
-	if err := db.QueryRowContext(ctx, hashCollisionQuery).Scan(&left, &right); err != nil {
+	if err := db.QueryRow(ctx, hashCollisionQuery).Scan(&left, &right); err != nil {
 		t.Fatal("collision search failed", err)
 	}
 	var equal bool
-	if err := db.QueryRowContext(ctx, equalHashQuery, left, right).Scan(&equal); err != nil || !equal || left == right {
+	if err := db.QueryRow(ctx, equalHashQuery, left, right).Scan(&equal); err != nil || !equal || left == right {
 		t.Fatal("invalid collision fixture")
 	}
 	for _, n := range []string{left, right} {
@@ -180,7 +180,7 @@ func TestPostgresLongOrders(t *testing.T) {
 	}
 }
 
-func temporaryPostgres(t *testing.T) *sql.DB {
+func temporaryPostgres(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("GOPHERMART_TEST_DATABASE_URI")
 	if dsn == "" {
@@ -193,37 +193,33 @@ func temporaryPostgres(t *testing.T) *sql.DB {
 	q := u.Query()
 	q.Set("connect_timeout", "5")
 	u.RawQuery = q.Encode()
-	admin, err := sql.Open("postgres", u.String())
+	admin, err := pgxpool.New(context.Background(), u.String())
 	if err != nil {
 		t.Fatal("Не удалось создать тестовое подключение")
 	}
 	t.Cleanup(func() {
-		if err := admin.Close(); err != nil {
-			t.Error("Ошибка закрытия тестового admin")
-		}
+		admin.Close()
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	name := fmt.Sprintf("gophermart_test_%d", time.Now().UnixNano())
-	if _, err := admin.ExecContext(ctx, fmt.Sprintf(createTestDatabaseQuery, name)); err != nil {
+	if _, err := admin.Exec(ctx, fmt.Sprintf(createTestDatabaseQuery, name)); err != nil {
 		t.Fatal("Не удалось создать временную БД; проверьте отдельный локальный PostgreSQL и CREATEDB")
 	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if _, err := admin.ExecContext(ctx, fmt.Sprintf(dropTestDatabaseQuery, name)); err != nil {
+		if _, err := admin.Exec(ctx, fmt.Sprintf(dropTestDatabaseQuery, name)); err != nil {
 			t.Error("Не удалось удалить созданную тестом временную БД")
 		}
 	})
 	u.Path = "/" + name
-	db, err := sql.Open("postgres", u.String())
+	db, err := pgxpool.New(context.Background(), u.String())
 	if err != nil {
 		t.Fatal("Не удалось подключиться к временной БД")
 	}
 	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Error("Ошибка закрытия тестового пула")
-		}
+		db.Close()
 	})
 	if err := migrations.Up(ctx, db); err != nil {
 		t.Fatal("Начальная миграция не прошла")
@@ -327,7 +323,7 @@ func TestPostgresIntegration(t *testing.T) {
 	if history, err := p.Withdrawals(ctx, second); err != nil || len(history) != 0 {
 		t.Fatal("foreign history visible")
 	}
-	if _, err := db.ExecContext(ctx, rejectTestWithdrawalQuery); err != nil {
+	if _, err := db.Exec(ctx, rejectTestWithdrawalQuery); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.Withdraw(ctx, first, "rollback", 25); err == nil {

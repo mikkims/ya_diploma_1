@@ -44,7 +44,7 @@ func run(ctx context.Context, args []string, log zerolog.Logger) error {
 		logger.Failure(log.Error(), "auth.new", err).Msg("startup failed")
 		return err
 	}
-	client, err := accrual.New(cfg.AccrualAddress)
+	client, err := accrual.New(cfg.AccrualAddress, log)
 	if err != nil {
 		logger.Failure(log.Error(), "accrual.new", err).Msg("startup failed")
 		return err
@@ -56,11 +56,7 @@ func run(ctx context.Context, args []string, log zerolog.Logger) error {
 		logger.Failure(log.Error(), "database.open", err).Msg("startup failed")
 		return err
 	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			logger.Failure(log.Error(), "database.close", err).Msg("database close failed")
-		}
-	}()
+	defer db.Close()
 	migrationCtx, stop := context.WithTimeout(ctx, 15*time.Second)
 	err = migrations.Up(migrationCtx, db)
 	stop()

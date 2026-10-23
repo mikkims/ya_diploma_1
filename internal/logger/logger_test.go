@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog"
 )
 
@@ -29,7 +29,7 @@ func TestFailureCategories(t *testing.T) {
 	}{
 		{"cancel", fmt.Errorf("password=secret: %w", context.Canceled), "canceled", ""},
 		{"timeout", &url.Error{Op: "GET", URL: "http://user:secret@host/path?token=secret", Err: context.DeadlineExceeded}, "timeout", ""},
-		{"sql", &pq.Error{Code: "23514", Message: "secret DSN password", Detail: "request-body"}, "database", `"sqlstate":"23514"`},
+		{"sql", &pgconn.PgError{Code: "23514", Message: "secret DSN password", Detail: "request-body"}, "database", `"sqlstate":"23514"`},
 		{"http", testStatusError(503), "http_status", `"http_status":503`},
 		{"json", &json.UnmarshalTypeError{Value: "secret", Field: "token"}, "invalid_response", ""},
 		{"internal", fmt.Errorf("postgres://user:secret@host/db?token=secret request-body"), "internal", ""},
@@ -64,6 +64,23 @@ func TestMetadataOnly(t *testing.T) {
 	r.Header.Set("Cookie", "secret")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
+	var entries []map[string]any
+	decoder := json.NewDecoder(strings.NewReader(output.String()))
+	for decoder.More() {
+		var entry map[string]any
+		if err := decoder.Decode(&entry); err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, entry)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one HTTP record, got %d", len(entries))
+	}
+	for _, field := range []string{"method", "duration", "status", "size"} {
+		if _, ok := entries[0][field]; !ok {
+			t.Errorf("missing field %s", field)
+		}
+	}
 	if strings.Contains(output.String(), "secret") || strings.Contains(output.String(), "sensitive") || !strings.Contains(output.String(), `"status":202`) || !strings.Contains(output.String(), `"size":2`) {
 		t.Fatalf("unexpected metadata: %s", output.String())
 	}

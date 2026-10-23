@@ -95,11 +95,9 @@ func Middleware(log zerolog.Logger) func(http.Handler) http.Handler {
 			log.Info().
 				Str("method", r.Method).
 				Dur("duration", time.Since(startedAt)).
-				Msg("request handled")
-			log.Info().
 				Int("status", response.status).
 				Int("size", response.size).
-				Msg("response sent")
+				Msg("request handled")
 		})
 	}
 }

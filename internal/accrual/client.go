@@ -12,9 +12,11 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mikkims/ya_diploma_1/internal/model"
+	"github.com/rs/zerolog"
 )
 
 // Result содержит проверенный статус и необязательное точное начисление.
@@ -43,18 +45,22 @@ func (e statusError) HTTPStatus() int { return int(e) }
 
 // Client ограничивает длительность и размер ответа внешнего API.
 type Client struct {
-	base string
-	http *http.Client
+	base        string
+	http        *http.Client
+	log         zerolog.Logger
+	mu          sync.Mutex
+	pausedUntil time.Time
 }
 
 // New создаёт клиент без перенаправлений и с таймаутом пять секунд.
-func New(base string) (*Client, error) {
+func New(base string, log zerolog.Logger) (*Client, error) {
 	u, err := url.Parse(base)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return nil, fmt.Errorf("invalid accrual URL")
 	}
 	return &Client{
 		base: strings.TrimRight(base, "/"),
+		log:  log,
 		http: &http.Client{Timeout: 5 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
@@ -64,6 +70,40 @@ func (c *Client) Fetch(ctx context.Context, number string) (result Result, err e
 	if !model.ValidOrder(number) {
 		return Result{}, model.ErrInvalidOrder
 	}
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := c.waitReady(ctx); err != nil {
+			return Result{}, err
+		}
+		result, err = c.fetch(ctx, number)
+		var status statusError
+		if !errors.As(err, &status) || status < 500 || status > 599 || attempt == 2 {
+			return result, err
+		}
+		if !wait(ctx, time.Duration(1<<attempt)*100*time.Millisecond) {
+			return Result{}, ctx.Err()
+		}
+	}
+	return result, err
+}
+
+func (c *Client) waitReady(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		delay := time.Until(c.pausedUntil)
+		c.mu.Unlock()
+		if delay <= 0 {
+			return nil
+		}
+		if !wait(ctx, delay) {
+			return ctx.Err()
+		}
+	}
+}
+
+func (c *Client) fetch(ctx context.Context, number string) (result Result, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/orders/"+number, nil)
 	if err != nil {
 		return Result{}, fmt.Errorf("create accrual request: %w", err)
@@ -82,7 +122,18 @@ func (c *Client) Fetch(ctx context.Context, number string) (result Result, err e
 		return Result{}, nil
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return Result{}, &RateLimitError{RetryAfter: retryAfter(resp.Header.Get("Retry-After"), time.Now())}
+		value := resp.Header.Get("Retry-After")
+		delay, parseErr := retryAfter(value, time.Now())
+		if parseErr != nil {
+			c.log.Warn().Err(parseErr).Str("retry_after", value).Msg("invalid accrual Retry-After")
+		}
+		until := time.Now().Add(delay)
+		c.mu.Lock()
+		if until.After(c.pausedUntil) {
+			c.pausedUntil = until
+		}
+		c.mu.Unlock()
+		return Result{}, &RateLimitError{RetryAfter: delay}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return Result{}, statusError(resp.StatusCode)
@@ -114,15 +165,18 @@ func (c *Client) Fetch(ctx context.Context, number string) (result Result, err e
 	return result, nil
 }
 
-func retryAfter(value string, now time.Time) time.Duration {
+func retryAfter(value string, now time.Time) (time.Duration, error) {
 	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
 		if seconds > math.MaxInt64/int64(time.Second) {
-			return time.Duration(math.MaxInt64)
+			return time.Duration(math.MaxInt64), nil
 		}
-		return time.Duration(seconds) * time.Second
+		return time.Duration(seconds) * time.Second, nil
 	}
-	if date, err := http.ParseTime(value); err == nil && date.After(now) {
-		return date.Sub(now)
+	if date, err := http.ParseTime(value); err == nil {
+		if date.After(now) {
+			return date.Sub(now), nil
+		}
+		return time.Second, nil
 	}
-	return time.Second
+	return time.Second, fmt.Errorf("parse Retry-After: invalid seconds or HTTP date")
 }

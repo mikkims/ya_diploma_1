@@ -307,3 +307,38 @@ func TestGzipAPI(t *testing.T) {
 		t.Fatal("decompressed size bound")
 	}
 }
+
+type balanceService struct {
+	Service
+	balance func(context.Context, int64) (model.Balance, error)
+}
+
+func (s balanceService) Balance(ctx context.Context, id int64) (model.Balance, error) {
+	return s.balance(ctx, id)
+}
+
+func TestRouterAcceptsServiceInterface(t *testing.T) {
+	a, err := auth.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := a.Token(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	s := balanceService{balance: func(ctx context.Context, id int64) (model.Balance, error) {
+		called = true
+		if id != 7 {
+			t.Errorf("user id %d", id)
+		}
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("request deadline missing")
+		}
+		return model.Balance{Current: 125}, nil
+	}}
+	w := request(NewRouter(s, a, zerolog.Nop()), http.MethodGet, "/api/user/balance", "", "", "Bearer "+token)
+	if !called || w.Code != 200 || w.Body.String() != `{"current":1.25,"withdrawn":0.00}` {
+		t.Fatalf("balance: %d %s", w.Code, w.Body.String())
+	}
+}

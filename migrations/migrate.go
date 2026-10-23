@@ -3,50 +3,44 @@ package migrations
 
 import (
 	"context"
-	"database/sql"
 	"embed"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
-	"github.com/golang-migrate/migrate/v4/database/postgres"
+	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 //go:embed *.sql
 var files embed.FS
 
-const migrationTimeoutsQuery = `
-SET statement_timeout = '5s';
-SET lock_timeout = '5s';
-`
-
 // Up применяет миграции на выделенном соединении с ограничением SQL по времени.
-func Up(ctx context.Context, db *sql.DB) (err error) {
-	conn, err := db.Conn(ctx)
-	if err != nil {
+func Up(ctx context.Context, pool *pgxpool.Pool) (err error) {
+	config := pool.Config().ConnConfig.Copy()
+	config.ConnectTimeout = 5 * time.Second
+	config.RuntimeParams["statement_timeout"] = "5s"
+	config.RuntimeParams["lock_timeout"] = "5s"
+	db := stdlib.OpenDB(*config)
+	db.SetMaxOpenConns(1)
+	defer func() { err = errors.Join(err, db.Close()) }()
+	if err := db.PingContext(ctx); err != nil {
 		return fmt.Errorf("migration connection: %w", err)
-	}
-	defer func() {
-		if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, sql.ErrConnDone) {
-			err = errors.Join(err, fmt.Errorf("close migration connection: %w", closeErr))
-		}
-	}()
-	if _, err := conn.ExecContext(ctx, migrationTimeoutsQuery); err != nil {
-		return fmt.Errorf("migration timeouts: %w", err)
 	}
 	source, err := iofs.New(files, ".")
 	if err != nil {
 		return fmt.Errorf("migration source: %w", err)
 	}
-	driver, err := postgres.WithConnection(ctx, conn, &postgres.Config{StatementTimeout: 5 * time.Second})
+	driver, err := pgxmigrate.WithInstance(db, &pgxmigrate.Config{StatementTimeout: 5 * time.Second})
 	if err != nil {
 		return errors.Join(fmt.Errorf("migration driver: %w", err), source.Close())
 	}
-	m, err := migrate.NewWithInstance("iofs", source, "postgres", driver)
+	m, err := migrate.NewWithInstance("iofs", source, "pgx5", driver)
 	if err != nil {
-		return errors.Join(fmt.Errorf("create migrator: %w", err), source.Close())
+		return errors.Join(fmt.Errorf("create migrator: %w", err), source.Close(), driver.Close())
 	}
 	defer func() {
 		sourceErr, dbErr := m.Close()

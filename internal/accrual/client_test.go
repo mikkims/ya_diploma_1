@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/mikkims/ya_diploma_1/internal/model"
 	"github.com/rs/zerolog"
 )
@@ -27,7 +27,7 @@ type closeFailureBody struct{ io.Reader }
 func (b closeFailureBody) Close() error { return errors.New("secret close failure") }
 
 func TestFetchCloseFailure(t *testing.T) {
-	c, err := New("http://example.test")
+	c, err := New("http://example.test", zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestFetchCloseFailure(t *testing.T) {
 func TestWorkerSafeDiagnostics(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c, err := New("http://example.test")
+	c, err := New("http://example.test", zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestWorkerSafeDiagnostics(t *testing.T) {
 	})
 	store := workerStore{
 		pending: func(context.Context) ([]string, error) {
-			return []string{"00"}, &pq.Error{Code: "08006", Message: "postgres://user:secret@host/db"}
+			return []string{"00"}, &pgconn.PgError{Code: "08006", Message: "postgres://user:secret@host/db"}
 		},
 		apply: func(context.Context, string, string, *model.Money) error {
 			cancel()
@@ -108,7 +108,7 @@ func TestFetch(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			c, err := New(server.URL)
+			c, err := New(server.URL, zerolog.Nop())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -126,10 +126,10 @@ func TestFetch(t *testing.T) {
 			}
 		})
 	}
-	if _, err := New("file:///x"); err == nil {
+	if _, err := New("file:///x", zerolog.Nop()); err == nil {
 		t.Fatal("invalid URL")
 	}
-	c, _ := New("http://localhost")
+	c, _ := New("http://localhost", zerolog.Nop())
 	if _, err := c.Fetch(context.Background(), "no/path"); !errors.Is(err, model.ErrInvalidOrder) {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func money(m model.Money) *model.Money { return &m }
 
 func TestNewRejectsInvalidURL(t *testing.T) {
 	for _, bad := range []string{"", "file:///tmp/test", "http://a?key=secret", "http://u:p@host", "http://a/#fragment", "://"} {
-		if _, err := New(bad); err == nil {
+		if _, err := New(bad, zerolog.Nop()); err == nil {
 			t.Errorf("accepted invalid URL")
 		}
 	}
@@ -148,7 +148,7 @@ func TestNewRejectsInvalidURL(t *testing.T) {
 func TestRateLimitAndCancellation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Retry-After", "3"); w.WriteHeader(429) }))
 	defer server.Close()
-	c, _ := New(server.URL)
+	c, _ := New(server.URL, zerolog.Nop())
 	_, err := c.Fetch(context.Background(), "00")
 	var limited *RateLimitError
 	if !errors.As(err, &limited) || limited.RetryAfter != 3*time.Second || limited.Error() == "" {
@@ -167,7 +167,7 @@ func TestRetryAfter(t *testing.T) {
 		value string
 		want  time.Duration
 	}{{"", time.Second}, {"invalid", time.Second}, {"-1", time.Second}, {"2", 2 * time.Second}, {now.Add(time.Minute).Format(http.TimeFormat), time.Minute}} {
-		if got := retryAfter(tt.value, now); got != tt.want {
+		if got, _ := retryAfter(tt.value, now); got != tt.want {
 			t.Errorf("retry %q=%v", tt.value, got)
 		}
 	}
@@ -203,7 +203,7 @@ func TestWorkerResumesAndApplies(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	c, _ := New(server.URL)
+	c, _ := New(server.URL, zerolog.Nop())
 	called := false
 	store := workerStore{pending: func(context.Context) ([]string, error) { return []string{"00"}, nil }, apply: func(_ context.Context, n, status string, m *model.Money) error {
 		if n != "00" || status != model.Processed || m == nil || *m != 550 {
@@ -221,27 +221,35 @@ func TestWorkerResumesAndApplies(t *testing.T) {
 
 func TestWorkerGlobalPause(t *testing.T) {
 	var calls atomic.Int64
-	first := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		first <- struct{}{}
 		w.Header().Set("Retry-After", "60")
 		w.WriteHeader(429)
 	}))
 	defer server.Close()
-	c, _ := New(server.URL)
+	c, _ := New(server.URL, zerolog.Nop())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
-	store := workerStore{pending: func(context.Context) ([]string, error) { return []string{"00", "18"}, nil }, apply: func(context.Context, string, string, *model.Money) error { t.Error("429 applied"); return nil }}
+	store := workerStore{pending: func(context.Context) ([]string, error) { return []string{"00", "18", "26", "34", "42", "59"}, nil }, apply: func(context.Context, string, string, *model.Money) error { t.Error("429 applied"); return nil }}
 	go func() { defer close(done); Run(ctx, store, c, zerolog.Nop()) }()
-	select {
-	case <-first:
-	case <-time.After(2 * time.Second):
-		t.Fatal("no request")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.mu.Lock()
+		paused := c.pausedUntil.After(time.Now())
+		c.mu.Unlock()
+		if paused {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no shared pause")
+		}
+		time.Sleep(time.Millisecond)
 	}
+	time.Sleep(50 * time.Millisecond)
+	before := calls.Load()
 	time.Sleep(250 * time.Millisecond)
-	if calls.Load() != 1 {
+	if before < 1 || before > 4 || calls.Load() != before {
 		t.Fatal("global pause ignored")
 	}
 	cancel()
@@ -257,8 +265,8 @@ func TestWorkerTemporaryResultsAndErrors(t *testing.T) {
 		t.Run(fmt.Sprint(code), func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(code) }))
 			defer server.Close()
-			c, _ := New(server.URL)
-			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			c, _ := New(server.URL, zerolog.Nop())
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			applied := false
 			store := workerStore{pending: func(context.Context) ([]string, error) { return []string{"00"}, nil }, apply: func(_ context.Context, _ string, status string, _ *model.Money) error {
@@ -276,6 +284,9 @@ func TestWorkerTemporaryResultsAndErrors(t *testing.T) {
 		})
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c, _ := New("http://localhost")
-	Run(ctx, workerStore{pending: func(context.Context) ([]string, error) { cancel(); return nil, errors.New("DB unavailable") }}, c, zerolog.Nop())
+	c, _ := New("http://localhost", zerolog.Nop())
+	Run(ctx, workerStore{pending: func(context.Context) ([]string, error) {
+		cancel()
+		return nil, errors.New("DB unavailable")
+	}}, c, zerolog.Nop())
 }

@@ -3,12 +3,14 @@ package storage
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"math"
+	"time"
 
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mikkims/ya_diploma_1/internal/model"
 )
 
@@ -85,24 +87,24 @@ WHERE id = $1 AND balance <= $3
 `
 const updateOrderQuery = `
 UPDATE orders
-SET status = CASE WHEN $2 = '' THEN status ELSE $2 END,
+SET status = CASE WHEN $2::text = '' THEN status ELSE $2::text::order_status END,
     accrual = $3,
     updated_at = clock_timestamp()
 WHERE number = $1
 `
 
 // Postgres использует пул соединений; его закрывает владелец приложения.
-type Postgres struct{ db *sql.DB }
+type Postgres struct{ db *pgxpool.Pool }
 
 // New создаёт хранилище на открытом пуле PostgreSQL.
-func New(db *sql.DB) *Postgres { return &Postgres{db: db} }
+func New(db *pgxpool.Pool) *Postgres { return &Postgres{db: db} }
 
 // CreateUser атомарно создаёт уникальный логин и возвращает ID.
 func (p *Postgres) CreateUser(ctx context.Context, login, hash string) (int64, error) {
 	var id int64
-	err := p.db.QueryRowContext(ctx, createUserQuery, login, hash).Scan(&id)
-	var pgErr *pq.Error
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.Constraint == "users_login_key" {
+	err := p.db.QueryRow(ctx, createUserQuery, login, hash).Scan(&id)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "users_login_key" {
 		return 0, model.ErrLoginTaken
 	}
 	if err != nil {
@@ -114,8 +116,8 @@ func (p *Postgres) CreateUser(ctx context.Context, login, hash string) (int64, e
 // UserByLogin возвращает учётную запись без раскрытия отсутствия логина клиенту.
 func (p *Postgres) UserByLogin(ctx context.Context, login string) (model.User, error) {
 	var u model.User
-	err := p.db.QueryRowContext(ctx, userQuery, login).Scan(&u.ID, &u.Login, &u.PasswordHash)
-	if errors.Is(err, sql.ErrNoRows) {
+	err := p.db.QueryRow(ctx, userQuery, login).Scan(&u.ID, &u.Login, &u.PasswordHash)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return u, model.ErrUnauthorized
 	}
 	if err != nil {
@@ -127,15 +129,15 @@ func (p *Postgres) UserByLogin(ctx context.Context, login string) (model.User, e
 // AddOrder использует уникальность БД, затем различает свой и чужой повтор.
 func (p *Postgres) AddOrder(ctx context.Context, userID int64, number string) (bool, error) {
 	var inserted string
-	err := p.db.QueryRowContext(ctx, addOrderQuery, number, userID).Scan(&inserted)
+	err := p.db.QueryRow(ctx, addOrderQuery, number, userID).Scan(&inserted)
 	if err == nil {
 		return true, nil
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	if !errors.Is(err, pgx.ErrNoRows) {
 		return false, fmt.Errorf("insert order: %w", err)
 	}
 	var owner int64
-	if err := p.db.QueryRowContext(ctx, ownerQuery, number).Scan(&owner); err != nil {
+	if err := p.db.QueryRow(ctx, ownerQuery, number).Scan(&owner); err != nil {
 		return false, fmt.Errorf("get order owner: %w", err)
 	}
 	if owner != userID {
@@ -146,23 +148,19 @@ func (p *Postgres) AddOrder(ctx context.Context, userID int64, number string) (b
 
 // Orders возвращает только заказы пользователя от новых к старым.
 func (p *Postgres) Orders(ctx context.Context, userID int64) (result []model.Order, err error) {
-	rows, err := p.db.QueryContext(ctx, ordersQuery, userID)
+	rows, err := p.db.Query(ctx, ordersQuery, userID)
 	if err != nil {
 		return nil, fmt.Errorf("list orders: %w", err)
 	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("close orders: %w", closeErr))
-		}
-	}()
+	defer rows.Close()
 	for rows.Next() {
 		var o model.Order
-		var amount sql.NullInt64
+		var amount *int64
 		if err := rows.Scan(&o.Number, &o.Status, &amount, &o.UploadedAt); err != nil {
 			return nil, fmt.Errorf("scan order: %w", err)
 		}
-		if amount.Valid {
-			value := model.Money(amount.Int64)
+		if amount != nil {
+			value := model.Money(*amount)
 			o.Accrual = &value
 		}
 		result = append(result, o)
@@ -173,8 +171,8 @@ func (p *Postgres) Orders(ctx context.Context, userID int64) (result []model.Ord
 // Balance возвращает сохранённые суммы одного пользователя.
 func (p *Postgres) Balance(ctx context.Context, userID int64) (model.Balance, error) {
 	var b model.Balance
-	err := p.db.QueryRowContext(ctx, balanceQuery, userID).Scan(&b.Current, &b.Withdrawn)
-	if errors.Is(err, sql.ErrNoRows) {
+	err := p.db.QueryRow(ctx, balanceQuery, userID).Scan(&b.Current, &b.Withdrawn)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return b, model.ErrUnauthorized
 	}
 	if err != nil {
@@ -188,17 +186,19 @@ func (p *Postgres) Withdraw(ctx context.Context, userID int64, number string, am
 	if amount <= 0 {
 		return model.ErrInvalidInput
 	}
-	tx, err := p.db.BeginTx(ctx, nil)
+	tx, err := p.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin withdrawal: %w", err)
 	}
 	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
 			err = errors.Join(err, fmt.Errorf("rollback withdrawal: %w", rollbackErr))
 		}
 	}()
 	var balance, withdrawn model.Money
-	if err := tx.QueryRowContext(ctx, withdrawBalanceQuery, userID).Scan(&balance, &withdrawn); err != nil {
+	if err := tx.QueryRow(ctx, withdrawBalanceQuery, userID).Scan(&balance, &withdrawn); err != nil {
 		return fmt.Errorf("lock balance: %w", err)
 	}
 	if balance < amount {
@@ -207,13 +207,13 @@ func (p *Postgres) Withdraw(ctx context.Context, userID int64, number string, am
 	if withdrawn > model.Money(math.MaxInt64)-amount {
 		return fmt.Errorf("withdrawn total overflow")
 	}
-	if _, err := tx.ExecContext(ctx, debitQuery, userID, amount); err != nil {
+	if _, err := tx.Exec(ctx, debitQuery, userID, amount); err != nil {
 		return fmt.Errorf("debit balance: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, withdrawalQuery, userID, number, amount); err != nil {
+	if _, err := tx.Exec(ctx, withdrawalQuery, userID, number, amount); err != nil {
 		return fmt.Errorf("record withdrawal: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit withdrawal: %w", err)
 	}
 	return nil
@@ -221,15 +221,11 @@ func (p *Postgres) Withdraw(ctx context.Context, userID int64, number string, am
 
 // Withdrawals возвращает историю только указанного пользователя.
 func (p *Postgres) Withdrawals(ctx context.Context, userID int64) (result []model.Withdrawal, err error) {
-	rows, err := p.db.QueryContext(ctx, withdrawalsQuery, userID)
+	rows, err := p.db.Query(ctx, withdrawalsQuery, userID)
 	if err != nil {
 		return nil, fmt.Errorf("list withdrawals: %w", err)
 	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("close withdrawals: %w", closeErr))
-		}
-	}()
+	defer rows.Close()
 	for rows.Next() {
 		var w model.Withdrawal
 		if err := rows.Scan(&w.Order, &w.Sum, &w.ProcessedAt); err != nil {
@@ -242,15 +238,11 @@ func (p *Postgres) Withdrawals(ctx context.Context, userID int64) (result []mode
 
 // Pending возвращает ограниченную порцию наиболее давно опрошенных заказов.
 func (p *Postgres) Pending(ctx context.Context) (result []string, err error) {
-	rows, err := p.db.QueryContext(ctx, pendingQuery)
+	rows, err := p.db.Query(ctx, pendingQuery)
 	if err != nil {
 		return nil, fmt.Errorf("list pending: %w", err)
 	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("close pending: %w", closeErr))
-		}
-	}()
+	defer rows.Close()
 	for rows.Next() {
 		var number string
 		if err := rows.Scan(&number); err != nil {
@@ -270,40 +262,39 @@ func (p *Postgres) Apply(ctx context.Context, number, status string, amount *mod
 	if amount != nil && (*amount < 0 || status != model.Processed) {
 		return model.ErrInvalidInput
 	}
-	tx, err := p.db.BeginTx(ctx, nil)
+	tx, err := p.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin accrual: %w", err)
 	}
 	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
 			err = errors.Join(err, fmt.Errorf("rollback accrual: %w", rollbackErr))
 		}
 	}()
 	var userID int64
 	var current string
-	if err := tx.QueryRowContext(ctx, lockOrderQuery, number).Scan(&userID, &current); err != nil {
+	if err := tx.QueryRow(ctx, lockOrderQuery, number).Scan(&userID, &current); err != nil {
 		return fmt.Errorf("lock order: %w", err)
 	}
 	if current == model.Invalid || current == model.Processed {
 		return nil
 	}
 	if amount != nil && *amount > 0 {
-		result, err := tx.ExecContext(ctx, creditQuery, userID, *amount, model.Money(math.MaxInt64)-*amount)
+		result, err := tx.Exec(ctx, creditQuery, userID, *amount, model.Money(math.MaxInt64)-*amount)
 		if err != nil {
 			return fmt.Errorf("credit balance: %w", err)
 		}
-		count, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("credit result: %w", err)
-		}
+		count := result.RowsAffected()
 		if count != 1 {
 			return fmt.Errorf("balance overflow or missing user")
 		}
 	}
-	if _, err := tx.ExecContext(ctx, updateOrderQuery, number, status, amount); err != nil {
+	if _, err := tx.Exec(ctx, updateOrderQuery, number, status, amount); err != nil {
 		return fmt.Errorf("update order: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit accrual: %w", err)
 	}
 	return nil

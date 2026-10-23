@@ -17,18 +17,27 @@ import (
 	"github.com/mikkims/ya_diploma_1/internal/logger"
 	"github.com/mikkims/ya_diploma_1/internal/model"
 	"github.com/mikkims/ya_diploma_1/internal/model/dto"
-	"github.com/mikkims/ya_diploma_1/internal/service"
 	"github.com/rs/zerolog"
 )
 
+type Service interface {
+	Register(context.Context, string, string) (int64, error)
+	Login(context.Context, string, string) (int64, error)
+	AddOrder(context.Context, int64, string) (bool, error)
+	Orders(context.Context, int64) ([]model.Order, error)
+	Balance(context.Context, int64) (model.Balance, error)
+	Withdraw(context.Context, int64, string, model.Money) error
+	Withdrawals(context.Context, int64) ([]model.Withdrawal, error)
+}
+
 type handler struct {
-	service *service.Service
+	service Service
 	auth    *auth.Auth
 	log     zerolog.Logger
 }
 
 // NewRouter связывает API, аутентификацию, gzip и безопасное логирование.
-func NewRouter(s *service.Service, a *auth.Auth, log zerolog.Logger) http.Handler {
+func NewRouter(s Service, a *auth.Auth, log zerolog.Logger) http.Handler {
 	h := &handler{service: s, auth: a, log: log}
 	r := gin.New()
 	r.Use(func(c *gin.Context) {

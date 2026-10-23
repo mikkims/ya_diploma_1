@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const restartCreateDatabaseQuery = `
@@ -50,37 +51,33 @@ func TestApplicationRestart(t *testing.T) {
 	query := u.Query()
 	query.Set("connect_timeout", "5")
 	u.RawQuery = query.Encode()
-	admin, err := sql.Open("postgres", u.String())
+	admin, err := pgxpool.New(context.Background(), u.String())
 	if err != nil {
 		t.Fatal("Ошибка подключения к тестовому PostgreSQL")
 	}
 	t.Cleanup(func() {
-		if err := admin.Close(); err != nil {
-			t.Error("admin close")
-		}
+		admin.Close()
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	name := fmt.Sprintf("gophermart_restart_%d", time.Now().UnixNano())
-	if _, err := admin.ExecContext(ctx, fmt.Sprintf(restartCreateDatabaseQuery, name)); err != nil {
+	if _, err := admin.Exec(ctx, fmt.Sprintf(restartCreateDatabaseQuery, name)); err != nil {
 		t.Fatal("Не удалось создать отдельную тестовую БД")
 	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if _, err := admin.ExecContext(ctx, fmt.Sprintf(restartDropDatabaseQuery, name)); err != nil {
+		if _, err := admin.Exec(ctx, fmt.Sprintf(restartDropDatabaseQuery, name)); err != nil {
 			t.Error("Не удалось удалить созданную тестовую БД")
 		}
 	})
 	u.Path = "/" + name
-	db, err := sql.Open("postgres", u.String())
+	db, err := pgxpool.New(context.Background(), u.String())
 	if err != nil {
 		t.Fatal("Не удалось открыть временную БД")
 	}
 	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Error("test DB close")
-		}
+		db.Close()
 	})
 	var complete atomic.Bool
 	var calls atomic.Int64
@@ -217,7 +214,7 @@ func TestApplicationRestart(t *testing.T) {
 	request(base, "/api/user/orders", token, "text/plain", "18", 202)
 	state := func(first, second string) bool {
 		var count int
-		return db.QueryRowContext(ctx, restartStateQuery, first, second).Scan(&count) == nil && count == 2
+		return db.QueryRow(ctx, restartStateQuery, first, second).Scan(&count) == nil && count == 2
 	}
 	poll(t, ctx, func() bool { return state("PROCESSING", "NEW") })
 	stop()
@@ -231,7 +228,7 @@ func TestApplicationRestart(t *testing.T) {
 	stop()
 	assertBalance := func() {
 		var balance int64
-		if err := db.QueryRowContext(ctx, restartBalanceQuery).Scan(&balance); err != nil || balance != 300 {
+		if err := db.QueryRow(ctx, restartBalanceQuery).Scan(&balance); err != nil || balance != 300 {
 			t.Fatalf("expected exactly 300 cents, got %d", balance)
 		}
 	}

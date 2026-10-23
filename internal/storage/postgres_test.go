@@ -2,300 +2,321 @@ package storage
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mikkims/ya_diploma_1/internal/model"
 )
 
-func mockStore(t *testing.T) (*Postgres, sqlmock.Sqlmock) {
+const testBalanceQuery = `
+UPDATE users
+SET balance = $2, withdrawn = $3
+WHERE id = $1
+`
+const testRejectDebitQuery = `
+ALTER TABLE users ADD CONSTRAINT test_debit CHECK (balance <> 500)
+`
+const testRejectHistoryQuery = `
+ALTER TABLE withdrawals ADD CONSTRAINT test_history CHECK (order_number <> '00')
+`
+const testRejectCreditQuery = `
+ALTER TABLE users ADD CONSTRAINT test_credit CHECK (balance <> 500)
+`
+const testRejectOrderQuery = `
+ALTER TABLE orders ADD CONSTRAINT test_order CHECK (status <> 'PROCESSED')
+`
+const testRejectWithdrawalCommitQuery = `
+CREATE FUNCTION reject_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN RAISE EXCEPTION 'test commit failure'; END;
+$$;
+CREATE CONSTRAINT TRIGGER test_commit AFTER INSERT ON withdrawals
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_commit();
+`
+const testRejectAccrualCommitQuery = `
+CREATE FUNCTION reject_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN RAISE EXCEPTION 'test commit failure'; END;
+$$;
+CREATE CONSTRAINT TRIGGER test_commit AFTER UPDATE ON orders
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_commit();
+`
+
+func setTestBalance(t *testing.T, db *pgxpool.Pool, id int64, balance, withdrawn int64) {
 	t.Helper()
-	db, m, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
-	if err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := db.Exec(ctx, testBalanceQuery, id, balance, withdrawn); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := m.ExpectationsWereMet(); err != nil {
-			t.Error(err)
-		}
-		m.ExpectClose()
-		if err := db.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	return New(db), m
 }
 
 func TestAccounts(t *testing.T) {
-	p, m := mockStore(t)
-	ctx := context.Background()
-	m.ExpectQuery(createUserQuery).WithArgs("alice", "hash").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
-	if id, err := p.CreateUser(ctx, "alice", "hash"); err != nil || id != 1 {
-		t.Fatalf("create %d %v", id, err)
+	p := New(temporaryPostgres(t))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	id, err := p.CreateUser(ctx, "alice", "hash")
+	if err != nil || id < 1 {
+		t.Fatalf("create: %d %v", id, err)
 	}
-	m.ExpectQuery(createUserQuery).WillReturnError(&pq.Error{Code: "23505", Constraint: "users_login_key"})
 	if _, err := p.CreateUser(ctx, "alice", "hash"); !errors.Is(err, model.ErrLoginTaken) {
 		t.Fatal(err)
 	}
-	m.ExpectQuery(createUserQuery).WillReturnError(errors.New("offline"))
-	if _, err := p.CreateUser(ctx, "a", "h"); err == nil {
-		t.Fatal("DB error hidden")
+	u, err := p.UserByLogin(ctx, "alice")
+	if err != nil || u.ID != id || u.Login != "alice" || u.PasswordHash != "hash" {
+		t.Fatalf("user: %+v %v", u, err)
 	}
-	m.ExpectQuery(userQuery).WithArgs("alice").WillReturnRows(sqlmock.NewRows([]string{"id", "login", "password_hash"}).AddRow(1, "alice", "hash"))
-	if u, err := p.UserByLogin(ctx, "alice"); err != nil || u.ID != 1 || u.PasswordHash != "hash" {
-		t.Fatal("user")
-	}
-	m.ExpectQuery(userQuery).WillReturnError(sql.ErrNoRows)
 	if _, err := p.UserByLogin(ctx, "missing"); !errors.Is(err, model.ErrUnauthorized) {
 		t.Fatal(err)
 	}
-	m.ExpectQuery(userQuery).WillReturnError(errors.New("offline"))
-	if _, err := p.UserByLogin(ctx, "a"); err == nil {
-		t.Fatal("DB error hidden")
-	}
-	m.ExpectQuery(balanceQuery).WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"balance", "withdrawn"}).AddRow(1050, 125))
-	if b, err := p.Balance(ctx, 1); err != nil || b.Current != 1050 || b.Withdrawn != 125 {
-		t.Fatal("balance")
-	}
-	m.ExpectQuery(balanceQuery).WillReturnError(sql.ErrNoRows)
-	if _, err := p.Balance(ctx, 2); !errors.Is(err, model.ErrUnauthorized) {
+	if _, err := p.Balance(ctx, id+100); !errors.Is(err, model.ErrUnauthorized) {
 		t.Fatal(err)
 	}
-	m.ExpectQuery(balanceQuery).WillReturnError(errors.New("offline"))
-	if _, err := p.Balance(ctx, 1); err == nil {
-		t.Fatal("DB error hidden")
-	}
 }
 
-func TestOrderOwnership(t *testing.T) {
-	for _, tt := range []struct {
-		name     string
-		inserted bool
-		owner    int64
-		want     error
-	}{{"new", true, 1, nil}, {"own", false, 1, nil}, {"foreign", false, 2, model.ErrOrderOwned}} {
-		t.Run(tt.name, func(t *testing.T) {
-			p, m := mockStore(t)
-			rows := sqlmock.NewRows([]string{"number"})
-			if tt.inserted {
-				rows.AddRow("00")
-			}
-			m.ExpectQuery(addOrderQuery).WithArgs("00", int64(1)).WillReturnRows(rows)
-			if !tt.inserted {
-				m.ExpectQuery(ownerQuery).WithArgs("00").WillReturnRows(sqlmock.NewRows([]string{"user_id"}).AddRow(tt.owner))
-			}
-			created, err := p.AddOrder(context.Background(), 1, "00")
-			if created != tt.inserted || !errors.Is(err, tt.want) {
-				t.Fatalf("ownership %v %v", created, err)
-			}
-		})
+func TestStorageClosedPool(t *testing.T) {
+	db := temporaryPostgres(t)
+	db.Close()
+	p := New(db)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	checks := []func() error{
+		func() error { _, err := p.CreateUser(ctx, "a", "h"); return err },
+		func() error { _, err := p.UserByLogin(ctx, "a"); return err },
+		func() error { _, err := p.AddOrder(ctx, 1, "00"); return err },
+		func() error { _, err := p.Orders(ctx, 1); return err },
+		func() error { _, err := p.Balance(ctx, 1); return err },
+		func() error { _, err := p.Withdrawals(ctx, 1); return err },
+		func() error { _, err := p.Pending(ctx); return err },
+		func() error { return p.Withdraw(ctx, 1, "00", 100) },
+		func() error { return p.Apply(ctx, "00", model.Processed, nil) },
 	}
-	p, m := mockStore(t)
-	m.ExpectQuery(addOrderQuery).WillReturnError(errors.New("offline"))
-	if _, err := p.AddOrder(context.Background(), 1, "0"); err == nil {
-		t.Fatal("insert error")
-	}
-	m.ExpectQuery(addOrderQuery).WillReturnRows(sqlmock.NewRows([]string{"number"}))
-	m.ExpectQuery(ownerQuery).WillReturnError(errors.New("offline"))
-	if _, err := p.AddOrder(context.Background(), 1, "0"); err == nil {
-		t.Fatal("owner error")
-	}
-}
-
-func TestRollbackFailurePreservesCause(t *testing.T) {
-	p, m := mockStore(t)
-	failure := errors.New("rollback failed")
-	m.ExpectBegin()
-	m.ExpectQuery(withdrawBalanceQuery).WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"balance", "withdrawn"}).AddRow(0, 0))
-	m.ExpectRollback().WillReturnError(failure)
-	err := p.Withdraw(context.Background(), 1, "00", 100)
-	if !errors.Is(err, model.ErrInsufficient) || !errors.Is(err, failure) {
-		t.Fatalf("withdrawal causes lost: %v", err)
-	}
-	m.ExpectBegin()
-	m.ExpectQuery(lockOrderQuery).WithArgs("00").WillReturnRows(sqlmock.NewRows([]string{"user_id", "status"}).AddRow(1, model.Processed))
-	m.ExpectRollback().WillReturnError(failure)
-	if err := p.Apply(context.Background(), "00", model.Processed, nil); !errors.Is(err, failure) {
-		t.Fatalf("rollback failure hidden: %v", err)
-	}
-}
-
-func TestLists(t *testing.T) {
-	p, m := mockStore(t)
-	ctx := context.Background()
-	now := time.Now().UTC()
-	m.ExpectQuery(ordersQuery).WithArgs(int64(3)).WillReturnRows(sqlmock.NewRows([]string{"number", "status", "accrual", "uploaded_at"}).AddRow("00", model.Processed, 0, now).AddRow("18", model.New, nil, now.Add(-time.Second)))
-	items, err := p.Orders(ctx, 3)
-	if err != nil || len(items) != 2 || items[0].Accrual == nil || *items[0].Accrual != 0 || items[1].Accrual != nil || !items[0].UploadedAt.After(items[1].UploadedAt) {
-		t.Fatalf("orders %v %v", items, err)
-	}
-	m.ExpectQuery(withdrawalsQuery).WithArgs(int64(3)).WillReturnRows(sqlmock.NewRows([]string{"order_number", "amount", "processed_at"}).AddRow("00", 125, now))
-	w, err := p.Withdrawals(ctx, 3)
-	if err != nil || len(w) != 1 || w[0].Sum != 125 {
-		t.Fatal("withdrawals")
-	}
-	m.ExpectQuery(pendingQuery).WillReturnRows(sqlmock.NewRows([]string{"number"}).AddRow("00").AddRow("18"))
-	if pending, err := p.Pending(ctx); err != nil || len(pending) != 2 {
-		t.Fatal("pending")
-	}
-	for _, kind := range []string{"orders", "withdrawals", "pending"} {
-		t.Run(kind, func(t *testing.T) {
-			p, m := mockStore(t)
-			var err error
-			switch kind {
-			case "orders":
-				m.ExpectQuery(ordersQuery).WillReturnError(errors.New("offline"))
-				_, err = p.Orders(ctx, 1)
-			case "withdrawals":
-				m.ExpectQuery(withdrawalsQuery).WillReturnError(errors.New("offline"))
-				_, err = p.Withdrawals(ctx, 1)
-			case "pending":
-				m.ExpectQuery(pendingQuery).WillReturnError(errors.New("offline"))
-				_, err = p.Pending(ctx)
-			}
-			if err == nil {
-				t.Fatal("query failure hidden")
-			}
-		})
+	for i, check := range checks {
+		if err := check(); err == nil {
+			t.Errorf("operation %d hid database error", i)
+		}
 	}
 }
 
 func TestWithdrawalAtomicity(t *testing.T) {
-	for _, phase := range []string{"ok", "insufficient", "overflow", "begin", "lock", "debit", "history", "commit"} {
+	for _, phase := range []string{"ok", "insufficient", "overflow", "lock", "debit", "history", "commit"} {
 		t.Run(phase, func(t *testing.T) {
-			p, m := mockStore(t)
-			failure := errors.New("synthetic failure")
-			if phase == "begin" {
-				m.ExpectBegin().WillReturnError(failure)
-			} else {
-				m.ExpectBegin()
-				balance, withdrawn := int64(1000), int64(0)
-				if phase == "insufficient" {
-					balance = 0
-				}
-				if phase == "overflow" {
-					withdrawn = math.MaxInt64
-				}
-				if phase == "lock" {
-					m.ExpectQuery(withdrawBalanceQuery).WithArgs(int64(1)).WillReturnError(failure)
-				} else {
-					m.ExpectQuery(withdrawBalanceQuery).WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"balance", "withdrawn"}).AddRow(balance, withdrawn))
-				}
-				if phase != "lock" && phase != "insufficient" && phase != "overflow" {
-					if phase == "debit" {
-						m.ExpectExec(debitQuery).WithArgs(int64(1), int64(500)).WillReturnError(failure)
-					} else {
-						m.ExpectExec(debitQuery).WithArgs(int64(1), int64(500)).WillReturnResult(sqlmock.NewResult(0, 1))
-						if phase == "history" {
-							m.ExpectExec(withdrawalQuery).WithArgs(int64(1), "00", int64(500)).WillReturnError(failure)
-						} else {
-							m.ExpectExec(withdrawalQuery).WithArgs(int64(1), "00", int64(500)).WillReturnResult(sqlmock.NewResult(1, 1))
-							if phase == "commit" {
-								m.ExpectCommit().WillReturnError(failure)
-							} else {
-								m.ExpectCommit()
-							}
-						}
-					}
-				}
-				if phase != "ok" && phase != "commit" {
-					m.ExpectRollback()
+			db := temporaryPostgres(t)
+			p := New(db)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			id, err := p.CreateUser(ctx, "alice", "hash")
+			if err != nil {
+				t.Fatal(err)
+			}
+			balance, withdrawn := int64(1000), int64(0)
+			if phase == "insufficient" {
+				balance = 0
+			}
+			if phase == "overflow" {
+				withdrawn = math.MaxInt64
+			}
+			setTestBalance(t, db, id, balance, withdrawn)
+			query := map[string]string{"debit": testRejectDebitQuery, "history": testRejectHistoryQuery, "commit": testRejectWithdrawalCommitQuery}[phase]
+			if query != "" {
+				if _, err := db.Exec(ctx, query); err != nil {
+					t.Fatal(err)
 				}
 			}
-			err := p.Withdraw(context.Background(), 1, "00", 500)
+			target := id
+			if phase == "lock" {
+				target += 100
+			}
+			err = p.Withdraw(ctx, target, "00", 500)
 			if (err == nil) != (phase == "ok") {
-				t.Fatalf("withdrawal %v", err)
+				t.Fatalf("withdraw: %v", err)
 			}
 			if phase == "insufficient" && !errors.Is(err, model.ErrInsufficient) {
 				t.Fatal(err)
 			}
+			want := model.Balance{Current: model.Money(balance), Withdrawn: model.Money(withdrawn)}
+			wantHistory := 0
+			if phase == "ok" {
+				want.Current -= 500
+				want.Withdrawn += 500
+				wantHistory = 1
+			}
+			got, err := p.Balance(ctx, id)
+			if err != nil || got != want {
+				t.Fatalf("balance %+v, want %+v: %v", got, want, err)
+			}
+			history, err := p.Withdrawals(ctx, id)
+			if err != nil || len(history) != wantHistory {
+				t.Fatalf("history: %v, %v", history, err)
+			}
 		})
-	}
-	p, _ := mockStore(t)
-	if err := p.Withdraw(context.Background(), 1, "0", 0); !errors.Is(err, model.ErrInvalidInput) {
-		t.Fatal(err)
 	}
 }
 
 func TestAccrualAtomicity(t *testing.T) {
-	for _, phase := range []string{"ok", "terminal", "zero", "missing", "pending", "begin", "lock", "credit", "overflow", "update", "commit"} {
+	for _, phase := range []string{"ok", "terminal", "zero", "missing", "pending", "lock", "credit", "overflow", "update", "commit"} {
 		t.Run(phase, func(t *testing.T) {
-			p, m := mockStore(t)
-			failure := errors.New("synthetic failure")
+			db := temporaryPostgres(t)
+			p := New(db)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			id, err := p.CreateUser(ctx, "alice", "hash")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := p.AddOrder(ctx, id, "00"); err != nil {
+				t.Fatal(err)
+			}
 			amount := model.Money(500)
 			value := &amount
 			status := model.Processed
-			if phase == "zero" {
+			current := model.New
+			wantBalance := model.Money(0)
+			switch phase {
+			case "terminal":
+				if err := p.Apply(ctx, "00", model.Invalid, nil); err != nil {
+					t.Fatal(err)
+				}
+				current = model.Invalid
+			case "zero":
 				amount = 0
-			}
-			if phase == "missing" {
+			case "missing":
 				value = nil
-			}
-			if phase == "pending" {
+			case "pending":
 				status = ""
 				value = nil
+			case "overflow":
+				setTestBalance(t, db, id, math.MaxInt64, 0)
+				wantBalance = model.Money(math.MaxInt64)
 			}
-			if phase == "begin" {
-				m.ExpectBegin().WillReturnError(failure)
-			} else {
-				m.ExpectBegin()
-				current := model.New
-				if phase == "terminal" {
-					current = model.Processed
-				}
-				if phase == "lock" {
-					m.ExpectQuery(lockOrderQuery).WillReturnError(failure)
-				} else {
-					m.ExpectQuery(lockOrderQuery).WithArgs("00").WillReturnRows(sqlmock.NewRows([]string{"user_id", "status"}).AddRow(1, current))
-				}
-				if phase != "lock" && phase != "terminal" {
-					if value != nil && *value > 0 {
-						expect := m.ExpectExec(creditQuery).WithArgs(int64(1), int64(500), int64(math.MaxInt64-500))
-						switch phase {
-						case "credit":
-							expect.WillReturnError(failure)
-						case "overflow":
-							expect.WillReturnResult(sqlmock.NewResult(0, 0))
-						default:
-							expect.WillReturnResult(sqlmock.NewResult(0, 1))
-						}
-					}
-					if phase != "credit" && phase != "overflow" {
-						expect := m.ExpectExec(updateOrderQuery).WithArgs("00", status, value)
-						if phase == "update" {
-							expect.WillReturnError(failure)
-						} else {
-							expect.WillReturnResult(sqlmock.NewResult(0, 1))
-							if phase == "commit" {
-								m.ExpectCommit().WillReturnError(failure)
-							} else {
-								m.ExpectCommit()
-							}
-						}
-					}
-				}
-				if phase == "terminal" || phase == "lock" || phase == "credit" || phase == "overflow" || phase == "update" {
-					m.ExpectRollback()
+			query := map[string]string{"credit": testRejectCreditQuery, "update": testRejectOrderQuery, "commit": testRejectAccrualCommitQuery}[phase]
+			if query != "" {
+				if _, err := db.Exec(ctx, query); err != nil {
+					t.Fatal(err)
 				}
 			}
-			err := p.Apply(context.Background(), "00", status, value)
-			wantOK := phase == "ok" || phase == "terminal" || phase == "zero" || phase == "missing" || phase == "pending"
-			if (err == nil) != wantOK {
-				t.Fatalf("apply %v", err)
+			number := "00"
+			if phase == "lock" {
+				number = "18"
+			}
+			err = p.Apply(ctx, number, status, value)
+			success := phase == "ok" || phase == "terminal" || phase == "zero" || phase == "missing" || phase == "pending"
+			if (err == nil) != success {
+				t.Fatalf("apply: %v", err)
+			}
+			if success && phase != "terminal" && phase != "pending" {
+				current = model.Processed
+				if value != nil {
+					wantBalance = *value
+				}
+			}
+			balance, err := p.Balance(ctx, id)
+			if err != nil || balance.Current != wantBalance {
+				t.Fatalf("balance: %+v, want %d: %v", balance, wantBalance, err)
+			}
+			orders, err := p.Orders(ctx, id)
+			if err != nil || len(orders) != 1 || orders[0].Status != current {
+				t.Fatalf("orders: %+v, %v", orders, err)
+			}
+			wantAmount := value
+			if !success || phase == "terminal" {
+				wantAmount = nil
+			}
+			gotAmount := orders[0].Accrual
+			if (gotAmount == nil) != (wantAmount == nil) || (wantAmount != nil && *gotAmount != *wantAmount) {
+				t.Fatal("nullable amount changed")
 			}
 		})
 	}
-	p, _ := mockStore(t)
-	negative := model.Money(-1)
-	if err := p.Apply(context.Background(), "0", "UNKNOWN", nil); !errors.Is(err, model.ErrInvalidInput) {
+}
+
+func TestCanceledTransactionReleasesPool(t *testing.T) {
+	db := temporaryPostgres(t)
+	p := New(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	id, err := p.CreateUser(ctx, "alice", "hash")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Apply(context.Background(), "0", model.Processed, &negative); !errors.Is(err, model.ErrInvalidInput) {
+	setTestBalance(t, db, id, 1000, 0)
+	blocker, err := db.Begin(ctx)
+	if err != nil {
 		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(ctx) }()
+	if _, err := blocker.Exec(ctx, withdrawBalanceQuery, id); err != nil {
+		t.Fatal(err)
+	}
+	blockedCtx, stop := context.WithTimeout(ctx, 50*time.Millisecond)
+	err = p.Withdraw(blockedCtx, id, "00", 100)
+	stop()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("blocked withdrawal: %v", err)
+	}
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Withdraw(ctx, id, "00", 100); err != nil {
+		t.Fatalf("pool unusable after cancellation: %v", err)
+	}
+	balance, err := p.Balance(ctx, id)
+	if err != nil || balance.Current != 900 || balance.Withdrawn != 100 {
+		t.Fatalf("balance: %+v %v", balance, err)
+	}
+	if db.Stat().AcquiredConns() != 0 {
+		t.Fatal("transaction retained a pool connection")
+	}
+}
+
+func TestStorageInputValidation(t *testing.T) {
+	p := New(nil)
+	negative := model.Money(-1)
+	for _, err := range []error{
+		p.Withdraw(context.Background(), 1, "00", 0),
+		p.Apply(context.Background(), "00", "UNKNOWN", nil),
+		p.Apply(context.Background(), "00", model.Processed, &negative),
+		p.Apply(context.Background(), "00", model.Processing, moneyForStorage(1)),
+	} {
+		if !errors.Is(err, model.ErrInvalidInput) {
+			t.Fatal(err)
+		}
+	}
+}
+
+func moneyForStorage(v model.Money) *model.Money { return &v }
+
+func TestStringColumnLimits(t *testing.T) {
+	db := temporaryPostgres(t)
+	p := New(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	id, err := p.CreateUser(ctx, strings.Repeat("a", 256), strings.Repeat("h", 60))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pgErr *pgconn.PgError
+	if _, err := p.CreateUser(ctx, strings.Repeat("b", 257), "h"); !errors.As(err, &pgErr) || pgErr.Code != "22001" {
+		t.Fatalf("login limit: %v", err)
+	}
+	if _, err := p.CreateUser(ctx, "hash-too-long", strings.Repeat("h", 61)); !errors.As(err, &pgErr) || pgErr.Code != "22001" {
+		t.Fatalf("hash limit: %v", err)
+	}
+	if _, err := p.AddOrder(ctx, id, strings.Repeat("0", 16385)); !errors.As(err, &pgErr) || pgErr.Code != "22001" {
+		t.Fatalf("number limit: %v", err)
+	}
+	setTestBalance(t, db, id, 100, 0)
+	if err := p.Withdraw(ctx, id, strings.Repeat("0", 16384), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Withdraw(ctx, id, strings.Repeat("0", 16385), 1); !errors.As(err, &pgErr) || pgErr.Code != "22001" {
+		t.Fatalf("withdrawal number limit: %v", err)
+	}
+	b, err := p.Balance(ctx, id)
+	if err != nil || b.Current != 99 || b.Withdrawn != 1 {
+		t.Fatalf("length failure did not roll back: %+v %v", b, err)
 	}
 }

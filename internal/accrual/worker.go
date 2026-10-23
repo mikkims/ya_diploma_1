@@ -3,6 +3,7 @@ package accrual
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/mikkims/ya_diploma_1/internal/logger"
@@ -16,7 +17,7 @@ type Store interface {
 	Apply(context.Context, string, string, *model.Money) error
 }
 
-// Run выполняет единственный цикл до отмены; вызывающая сторона владеет goroutine.
+// Run опрашивает заказы пулом воркеров до отмены и дожидается всех горутин.
 func Run(ctx context.Context, store Store, client *Client, log zerolog.Logger) {
 	for ctx.Err() == nil {
 		queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -25,32 +26,51 @@ func Run(ctx context.Context, store Store, client *Client, log zerolog.Logger) {
 		if err != nil {
 			logger.Failure(log.Warn(), "orders.pending", err).Msg("pending orders query failed")
 		}
-		for _, number := range numbers {
-			if ctx.Err() != nil {
-				return
-			}
-			result, err := client.Fetch(ctx, number)
-			var limit *RateLimitError
-			if errors.As(err, &limit) {
-				logger.Failure(log.Warn(), "accrual.fetch", err).Msg("accrual rate limited")
-				if !wait(ctx, limit.RetryAfter) {
-					return
+		jobs := make(chan string)
+		var workers sync.WaitGroup
+		for i := 0; i < 4 && i < len(numbers); i++ {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				for number := range jobs {
+					if ctx.Err() != nil {
+						return
+					}
+					result, err := client.Fetch(ctx, number)
+					if ctx.Err() != nil {
+						return
+					}
+					var limit *RateLimitError
+					if errors.As(err, &limit) {
+						logger.Failure(log.Warn(), "accrual.fetch", err).Msg("accrual rate limited")
+						continue
+					}
+					if err != nil {
+						logger.Failure(log.Warn(), "accrual.fetch", err).Msg("accrual request failed")
+					}
+					applyCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+					err = store.Apply(applyCtx, number, result.Status, result.Accrual)
+					cancel()
+					if err != nil {
+						logger.Failure(log.Warn(), "accrual.apply", err).Msg("accrual persistence failed")
+					}
+					if !wait(ctx, 200*time.Millisecond) {
+						return
+					}
 				}
-				break
-			}
-			if err != nil {
-				logger.Failure(log.Warn(), "accrual.fetch", err).Msg("accrual request failed")
-			}
-			applyCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			err = store.Apply(applyCtx, number, result.Status, result.Accrual)
-			cancel()
-			if err != nil {
-				logger.Failure(log.Warn(), "accrual.apply", err).Msg("accrual persistence failed")
-			}
-			if !wait(ctx, 200*time.Millisecond) {
+			}()
+		}
+		for _, number := range numbers {
+			select {
+			case <-ctx.Done():
+				close(jobs)
+				workers.Wait()
 				return
+			case jobs <- number:
 			}
 		}
+		close(jobs)
+		workers.Wait()
 		if !wait(ctx, time.Second) {
 			return
 		}
